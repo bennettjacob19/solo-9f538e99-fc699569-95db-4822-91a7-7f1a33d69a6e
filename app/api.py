@@ -35,12 +35,14 @@ T = TypeVar("T")
 
 _write_description = (
     "Write one 4 KiB block. By default the write is acknowledged only after "
-    "the data blocks, the parity block and the journal are all durable. Set "
-    "`power_loss` to simulate a crash in the middle: `data` lands the two data "
-    "blocks but leaves parity stale, `parity` lands only the parity block, "
-    "`neither` persists only the journal, and `both` lands everything but never "
-    "clears the journal. A simulated power loss stops the service; restart it "
-    "to run recovery."
+    "the data blocks, the parity block and the journal are all durable. "
+    "Writes changing at most 64 bytes are journaled as compact delta records "
+    "(the prepared journal write stays under 5 KiB including its header); "
+    "larger writes use full-stripe records. Set `power_loss` to simulate a "
+    "crash in the middle: `data` lands the two data blocks but leaves parity "
+    "stale, `parity` lands only the parity block, `neither` persists only the "
+    "journal, and `both` lands everything but never clears the journal. A "
+    "simulated power loss stops the service; restart it to run recovery."
 )
 
 

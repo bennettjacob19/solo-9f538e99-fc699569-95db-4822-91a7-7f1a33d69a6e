@@ -6,9 +6,15 @@ occupies offset ``i * 4096`` on all three disks and satisfies::
     parity[i] = data0[i] XOR data1[i]
 
 A stripe write is a whole-stripe operation guarded by the redo journal in
-``journal.py``.  Because both new data blocks are journaled, recovery can
-rebuild the entire stripe deterministically; the parity block never needs to
-be journaled as it is a pure XOR of the two data blocks.
+``journal.py``.  Two record shapes are used:
+
+* **full records** journal both new data blocks when a write changes more than
+  64 bytes (the classical path);
+* **delta records** journal only the changed ``(offset, value)`` bytes when the
+  collector's write touches at most 64 bytes of one data block.  The same
+  absolute byte replacements apply to the target data block and to the parity
+  block, so replay needs at most two member-disk block reads and converges from
+  every power-loss breakpoint.
 """
 
 from __future__ import annotations
@@ -37,7 +43,17 @@ from .errors import (
     SimulatedPowerLoss,
     VolumeCorrupt,
 )
-from .journal import Journal, JournalRecord, new_record
+from .journal import (
+    JOURNAL_PREPARE_BUDGET,
+    SMALL_WRITE_LIMIT,
+    DeltaEntry,
+    Journal,
+    JournalRecord,
+    apply_parity_entries,
+    apply_target_entries,
+    new_delta_record,
+    new_full_record,
+)
 
 ZERO_BLOCK = bytes(BLOCK_SIZE)
 POWER_LOSS_SCENARIOS = ("none", "data", "data0", "data1", "parity", "neither", "both")
@@ -173,7 +189,13 @@ class XorArray:
     def _recover(self) -> None:
         """Replay a pending journal record, tolerating a missing data disk.
 
-        When a data disk is configured offline we still commit the stripe to
+        Full records overwrite the whole stripe.  Delta records apply absolute
+        byte replacements to the target data block and to the parity block;
+        doing so is idempotent, so every power-loss breakpoint converges to the
+        same bytes and replaying one delta record never reads more than two
+        member-disk blocks.
+
+        When a data disk is configured offline the record is still committed to
         every online disk (including parity).  The journal is intentionally
         *not* cleared in that case, so a later restart without the offline flag
         can finish the job.  Repeated restarts with the same offline disk are
@@ -187,15 +209,10 @@ class XorArray:
         if record is None:
             return
 
-        applied: list[str] = []
-        if self.offline != "data0":
-            self._write_raw("data0", record.stripe, record.data0)
-            applied.append("data0")
-        if self.offline != "data1":
-            self._write_raw("data1", record.stripe, record.data1)
-            applied.append("data1")
-        self._write_raw("parity", record.stripe, record.parity)
-        applied.append("parity")
+        if record.is_delta:
+            info = self._recover_delta(record)
+        else:
+            info = self._recover_full(record)
 
         cleared = self.offline is None
         if cleared:
@@ -205,12 +222,92 @@ class XorArray:
             "recovered": True,
             "stripe": record.stripe,
             "sequence": record.seq,
-            "applied_to": applied,
+            "record_kind": "delta" if record.is_delta else "full",
             "journal_cleared": cleared,
             "pending_offline_disk": self.offline,
-            "data0_sha256": sha256_hex(record.data0),
-            "data1_sha256": sha256_hex(record.data1),
-            "parity_sha256": sha256_hex(record.parity),
+            "journal_prepared_bytes": record.prepared_bytes,
+            "member_block_reads": info["member_block_reads"],
+            "applied_to": info["applied_to"],
+            **info["hashes"],
+        }
+
+    def _recover_full(self, record: JournalRecord) -> dict[str, Any]:
+        applied: list[str] = []
+        if self.offline != "data0":
+            self._write_raw("data0", record.stripe, record.data0)
+            applied.append("data0")
+        if self.offline != "data1":
+            self._write_raw("data1", record.stripe, record.data1)
+            applied.append("data1")
+        self._write_raw("parity", record.stripe, record.parity)
+        applied.append("parity")
+        return {
+            "applied_to": applied,
+            # Full recovery derives everything from the journal itself.
+            "member_block_reads": 0,
+            "hashes": {
+                "data0_sha256": record.data0_sha256,
+                "data1_sha256": record.data1_sha256,
+                "parity_sha256": sha256_hex(record.parity),
+            },
+        }
+
+    def _recover_delta(self, record: JournalRecord) -> dict[str, Any]:
+        """Replay an absolute-byte delta record.
+
+        Each entry carries both the target data block's new byte and the
+        parity block's new byte, so both writes are unconditional absolute
+        replacements.  Replaying is idempotent at every breakpoint and across
+        repeated restarts, and never reads more than two member blocks.
+        """
+
+        stripe = record.stripe
+        target = record.target_name
+        assert target is not None
+        other = "data1" if target == "data0" else "data0"
+        entries = record.entries
+        applied: list[str] = []
+
+        # The parity block is always online in this drill and is always part
+        # of the replay: one member read, one absolute (idempotent) rewrite.
+        parity_block = self._read_raw("parity", stripe)
+        new_parity = apply_parity_entries(parity_block, entries)
+        self._write_raw("parity", stripe, new_parity)
+        applied.append("parity")
+        member_reads = 1
+
+        new_target: bytes | None = None
+        if self.offline == target:
+            # The target disk is absent.  Its logical view is reconstructed
+            # from the other data block and the freshly committed parity;
+            # that is the second (and last) member read.
+            other_block = self._read_raw(other, stripe)
+            member_reads += 1
+            new_target = xor_blocks(other_block, new_parity)
+        else:
+            # Second member read: the target block, overwritten absolutely.
+            target_block = self._read_raw(target, stripe)
+            member_reads += 1
+            new_target = apply_target_entries(target_block, entries)
+            self._write_raw(target, stripe, new_target)
+            applied.append(target)
+
+            # A missing data disk rebuilt at startup still holds the stale XOR
+            # of the other two disks for this stripe.  Its correct value is
+            # derived from the values already in hand, without another read.
+            if other in self.rebuilt_disks:
+                rebuilt_other = xor_blocks(new_target, new_parity)
+                self._write_raw(other, stripe, rebuilt_other)
+                applied.append(other)
+
+        return {
+            "applied_to": applied,
+            "member_block_reads": member_reads,
+            "hashes": {
+                f"{target}_sha256": sha256_hex(new_target),
+                "parity_sha256": sha256_hex(new_parity),
+                f"{other}_sha256": None,
+            },
         }
 
     # ----------------------------------------------------------------- state
@@ -355,9 +452,34 @@ class XorArray:
             current1 = self._read_raw("data1", idx)
             new0 = data if name == "data0" else current0
             new1 = data if name == "data1" else current1
+            new_parity = xor_blocks(new0, new1)
             seq = self._seq + 1
 
-            record = new_record(stripe=idx, seq=seq, data0=new0, data1=new1)
+            # Small, in-place updates (collector workload) are journaled as
+            # delta entries: the prepared journal write stays well under 5 KiB
+            # including its header.  Larger changes use full-stripe records.
+            # Each delta entry freezes both the target byte and the parity
+            # byte that must hold afterwards, so recovery is an idempotent
+            # absolute rewrite regardless of the crash breakpoint.
+            current_target = current0 if name == "data0" else current1
+            diff = tuple(
+                DeltaEntry(
+                    offset=off,
+                    value=data[off],
+                    parity_value=new_parity[off],
+                )
+                for off in range(BLOCK_SIZE)
+                if data[off] != current_target[off]
+            )
+            use_delta = len(diff) <= SMALL_WRITE_LIMIT
+            if use_delta:
+                record = new_delta_record(
+                    stripe=idx, seq=seq, target=name, entries=diff
+                )
+            else:
+                record = new_full_record(
+                    stripe=idx, seq=seq, data0=new0, data1=new1
+                )
             try:
                 self.journal.write_prepared(record)
             except OSError as exc:
@@ -372,18 +494,54 @@ class XorArray:
             landed: list[str] = []
             try:
                 if scenario in ("data", "data0", "data1"):
-                    targets = ["data0", "data1"] if scenario == "data" else [scenario]
+                    if use_delta:
+                        # Only the target data block carries new bytes.  A
+                        # single-block scenario aimed at the untouched disk is
+                        # a no-op for member writes; "data" lands both blocks,
+                        # rewriting identical bytes for the untouched one.
+                        other = "data1" if name == "data0" else "data0"
+                        if scenario == "data":
+                            targets = [name, other]
+                        elif scenario == name:
+                            targets = [name]
+                        else:
+                            targets = []
+                    else:
+                        targets = (
+                            ["data0", "data1"] if scenario == "data" else [scenario]
+                        )
                     for disk_name in targets:
-                        self._write_raw(disk_name, idx, new0 if disk_name == "data0" else new1)
+                        block_value = new0 if disk_name == "data0" else new1
+                        self._write_raw(disk_name, idx, block_value)
                         landed.append(disk_name)
                 if scenario in ("parity", "both"):
-                    self._write_raw("parity", idx, record.parity)
+                    self._write_raw("parity", idx, new_parity)
                     landed.append("parity")
+                    if scenario == "both":
+                        # "both" lands all three member blocks before the crash.
+                        if use_delta:
+                            self._write_raw(name, idx, data)
+                            if name not in landed:
+                                landed.append(name)
+                        else:
+                            for disk_name, block_value in (
+                                ("data0", new0),
+                                ("data1", new1),
+                            ):
+                                self._write_raw(disk_name, idx, block_value)
+                                landed.append(disk_name)
                 if scenario == "none":
-                    self._write_raw("data0", idx, new0)
-                    self._write_raw("data1", idx, new1)
-                    self._write_raw("parity", idx, record.parity)
-                    landed.extend(("data0", "data1", "parity"))
+                    if use_delta:
+                        # The untouched data block already equals its final
+                        # value, so only the target block and parity are written.
+                        self._write_raw(name, idx, data)
+                        self._write_raw("parity", idx, new_parity)
+                        landed.extend((name, "parity"))
+                    else:
+                        self._write_raw("data0", idx, new0)
+                        self._write_raw("data1", idx, new1)
+                        self._write_raw("parity", idx, new_parity)
+                        landed.extend(("data0", "data1", "parity"))
                     self.journal.clear(seq)
                     return {
                         "index": idx,
@@ -394,10 +552,14 @@ class XorArray:
                         "stripe_sha256": {
                             "data0": sha256_hex(new0),
                             "data1": sha256_hex(new1),
-                            "parity": sha256_hex(record.parity),
+                            "parity": sha256_hex(new_parity),
                         },
                         "sequence": seq,
                         "journal_cleared": True,
+                        "journal_record_kind": "delta" if use_delta else "full",
+                        "changed_bytes": len(diff),
+                        "journal_prepared_bytes": record.prepared_bytes,
+                        "journal_prepare_budget": JOURNAL_PREPARE_BUDGET,
                         "power_loss": "none",
                         "mode": self.mode,
                     }
@@ -411,6 +573,7 @@ class XorArray:
                         "sequence": seq,
                         "landed": landed,
                         "journal": "prepared",
+                        "journal_record_kind": "delta" if use_delta else "full",
                         "restart_required": True,
                     },
                 ) from exc
@@ -425,6 +588,10 @@ class XorArray:
                     "scenario": scenario,
                     "landed": landed,
                     "journal": "prepared",
+                    "journal_record_kind": "delta" if use_delta else "full",
+                    "changed_bytes": len(diff),
+                    "journal_prepared_bytes": record.prepared_bytes,
+                    "journal_prepare_budget": JOURNAL_PREPARE_BUDGET,
                     "restart_required": True,
                 },
             )
