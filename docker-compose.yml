@@ -1,0 +1,20 @@
+services:
+  array:
+    build: .
+    image: xor-array-drill:latest
+    ports:
+      - "8000:8000"
+    environment:
+      # Number of 4 KiB stripes per disk (capacity = STRIPES * 4096 bytes).
+      STRIPES: "${STRIPES:-16}"
+      # Set to data0 or data1 to restart with that data disk offline.
+      OFFLINE_DISK: "${OFFLINE_DISK:-none}"
+      FSYNC: "${FSYNC:-1}"
+    volumes:
+      # Named volume keeps the three disk images and the journal across
+      # `docker compose down && docker compose up`.
+      - array-data:/data
+    restart: "no"
+
+volumes:
+  array-data:
